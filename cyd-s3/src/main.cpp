@@ -42,8 +42,10 @@ struct SwitchUi {
   lv_obj_t* stateLabel;
 };
 SwitchUi ui[SWITCH_COUNT];
-lv_obj_t* statusLabel;
 lv_obj_t* statusDot;
+
+lv_obj_t* uiScreen = nullptr;
+lv_obj_t* slaveScreen = nullptr;
 
 unsigned long lastRefresh = 0;
 bool hasError = true;
@@ -155,6 +157,10 @@ void tileClickedCb(lv_event_t* e) {
   updateTile(index);
 }
 
+void tileClickedCb(lv_event_t* e);
+void buildSlaveScreen();
+void buildFooter(lv_obj_t* scr);
+
 void tile(int index) {
   int x, y, w;
   tilePos(index, x, y, w);
@@ -216,6 +222,8 @@ void tile(int index) {
 }
 
 void buildUi() {
+  uiScreen = lv_obj_create(NULL);
+  lv_screen_load(uiScreen);
   lv_obj_set_style_bg_color(lv_screen_active(), COL_BG, 0);
   lv_obj_set_style_bg_opa(lv_screen_active(), LV_OPA_COVER, 0);
 
@@ -233,24 +241,83 @@ void buildUi() {
   lv_obj_set_style_bg_color(statusDot, COL_ERR, 0);
   lv_obj_set_style_bg_opa(statusDot, LV_OPA_COVER, 0);
 
-  statusLabel = lv_label_create(lv_screen_active());
-  lv_label_set_text(statusLabel, "Connecting...");
-  lv_obj_set_style_text_color(statusLabel, COL_MUTED, 0);
-  lv_obj_set_style_text_font(statusLabel, &lv_font_sw_14, 0);
-  lv_obj_set_pos(statusLabel, 12, SCREEN_H - 24);
-
   for (int i = 0; i < SWITCH_COUNT; i++) {
     tile(i);
     updateTile(i);
   }
+  buildFooter(uiScreen);
+  buildSlaveScreen();
 }
 
 void setStatus(bool ok, const char* text) {
   hasError = !ok;
   errorMessage = text;
   lv_obj_set_style_bg_color(statusDot, ok ? COL_ACCENT : COL_ERR, 0);
-  lv_label_set_text(statusLabel, text);
-  lv_obj_set_style_text_color(statusLabel, ok ? COL_MUTED : COL_ERR, 0);
+  lv_obj_set_style_bg_opa(statusDot, LV_OPA_COVER, 0);
+  (void)text;
+}
+
+// ---------------------------------------------------------------------------
+// Second screen (swipe left from the home screen)
+// ---------------------------------------------------------------------------
+// Second screen + footer navigation buttons
+// ---------------------------------------------------------------------------
+void buildSlaveScreen();
+
+void footerCb(lv_event_t* e) {
+  const intptr_t target = (intptr_t)lv_event_get_user_data(e);
+  if (target == 1 && slaveScreen != nullptr && lv_screen_active() != slaveScreen) {
+    lv_screen_load_anim(slaveScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 150, 0, false);
+  } else if (target == 0 && uiScreen != nullptr && lv_screen_active() != uiScreen) {
+    lv_screen_load_anim(uiScreen, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 150, 0, false);
+  }
+}
+
+void buildFooter(lv_obj_t* scr) {
+  static const char* names[2] = {"Hem", "Skärm 2"};
+  for (int i = 0; i < 2; i++) {
+    const int w = (SCREEN_W - 2 * TILE_X0 - TILE_GAP) / 2;
+    lv_obj_t* btn = lv_obj_create(scr);
+    lv_obj_remove_style_all(btn);
+    lv_obj_set_pos(btn, TILE_X0 + i * (w + TILE_GAP), SCREEN_H - 44);
+    lv_obj_set_size(btn, w, 38);
+    lv_obj_set_style_bg_color(btn, COL_BG, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(btn, COL_OFF, 0);
+    lv_obj_set_style_border_width(btn, 2, 0);
+    lv_obj_set_style_radius(btn, 10, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x11314a), LV_STATE_PRESSED);
+    lv_obj_set_clickable(btn, true);
+    lv_obj_add_event_cb(btn, footerCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    lv_obj_t* lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, names[i]);
+    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_sw_16, 0);
+    lv_obj_center(lbl);
+  }
+}
+
+void buildSlaveScreen() {
+  slaveScreen = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(slaveScreen, COL_BG, 0);
+  lv_obj_set_style_bg_opa(slaveScreen, LV_OPA_COVER, 0);
+
+  lv_obj_t* title = lv_label_create(slaveScreen);
+  lv_label_set_text(title, "Skärm 2");
+  lv_obj_set_style_text_color(title, COL_TEXT, 0);
+  lv_obj_set_style_text_font(title, &lv_font_sw_20, 0);
+  lv_obj_set_pos(title, 12, 8);
+
+  lv_obj_t* slider = lv_slider_create(slaveScreen);
+  lv_obj_set_size(slider, 400, 16);
+  lv_obj_align(slider, LV_ALIGN_CENTER, 0, 0);
+  lv_slider_set_value(slider, 50, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(slider, COL_OFF, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(slider, COL_ACCENT, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(slider, COL_ACCENT, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(slider, 6, LV_PART_KNOB);
+
+  buildFooter(slaveScreen);
 }
 
 // ---------------------------------------------------------------------------
