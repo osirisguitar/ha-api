@@ -1,0 +1,7 @@
+{
+  "name": "ST77922",
+  "version": "1.0.0",
+  "description": "Freenove ST77922 QSPI TDDI display driver + integrated capacitive touch (FNK0104N 3.5\")",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

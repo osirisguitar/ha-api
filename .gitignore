@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+certs/
+*.crt
+*.pem
+cyd/.pio/
+cyd/src/secrets.h
+cyd/.vscode/
+cyd-s3/.pio/
+cyd-s3/src/secrets.h
+cyd-s3/.vscode/
