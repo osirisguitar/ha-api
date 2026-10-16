@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <ST77922.h>
@@ -323,17 +324,171 @@ void buildSlaveScreen() {
 // ---------------------------------------------------------------------------
 // ha-api calls
 // ---------------------------------------------------------------------------
+// Raw HTTP/1.1 over one persistent WiFiClientSecure instead of HTTPClient:
+// HTTPClient 2.0.17 probes idle TLS sockets (available() -> mbedtls read),
+// which errors and stops the session, forcing a fresh ~1 s handshake for
+// every request. Here the socket is never probed while idle; a failed
+// request triggers one honest reconnect+retry (toggles are /on / /off, so a
+// retry is idempotent). The 10 s state poll keeps the socket warm anyway.
+struct ApiEndpoint {
+  String host;
+  uint16_t port;
+  String base;
+};
+static ApiEndpoint apiEp;
+static WiFiClientSecure apiClient;
+
+static void initApiEndpoint() {
+  String u = API_BASE;
+  u.remove(0, u.indexOf("://") + 3);
+  const int slash = u.indexOf('/');
+  const String rest = (slash < 0) ? u : u.substring(0, slash);
+  apiEp.base = (slash < 0) ? "/" : u.substring(slash);
+  const int colon = rest.indexOf(':');
+  if (colon < 0) {
+    apiEp.host = rest;
+    apiEp.port = 443;
+  } else {
+    apiEp.host = rest.substring(0, colon);
+    apiEp.port = rest.substring(colon + 1).toInt();
+  }
+}
+// Read up to n bytes. WiFiClientSecure returns -1 transiently at TLS record
+// boundaries (available() dips to 0 between records), so reads are retried
+// until the request deadline rather than treated as fatal. -1 only when the
+// whole deadline has passed with nothing readable.
+static int readPatience(uint8_t* buf, int n, uint32_t timeoutMs) {
+  const unsigned long deadline = millis() + timeoutMs;
+  int done = 0;
+  while (done < n) {
+    const int got = apiClient.read(buf + done, n - done);
+    if (got > 0) {
+      done += got;
+      continue;
+    }
+    if ((long)(millis() - deadline) >= 0) return done > 0 ? done : -1;
+    delay(1);
+  }
+  return done;
+}
+
+int apiRequest(const uint32_t timeoutMs, const String& path, const char* method,
+               const String& payload, String* body) {
+  const unsigned long t0 = millis();
+
+  apiClient.setTimeout(timeoutMs);
+
+  String req = String(method) + " " + apiEp.base + path + " HTTP/1.1\r\n"
+               "Host: " + apiEp.host + "\r\n"
+               "Connection: keep-alive\r\n";
+  if (payload.length() > 0 || strcmp(method, "POST") == 0) {
+    req += "Content-Length: " + String(payload.length()) + "\r\n";
+  }
+  req += "\r\n";
+  req += payload;
+
+  // Send over the warm socket. Never *probe* it while idle (connected() /
+  // available() run a mbedtls read that errors and tears the session down);
+  // the write result is the liveness signal. If the peer closed it while
+  // idle, one reconnect+rewrite fixes the round trip.
+  if (apiClient.write((const uint8_t*)req.c_str(), req.length()) != req.length()) {
+    apiClient.stop();
+    if (!apiClient.connect(apiEp.host.c_str(), apiEp.port)) {
+      Serial.printf("%s %s -> -1 (no reconnect)\n", method, path);
+      return -1;
+    }
+    if (apiClient.write((const uint8_t*)req.c_str(), req.length()) != req.length()) {
+      Serial.printf("%s %s -> -1 (write)\n", method, path);
+      apiClient.stop();
+      return -1;
+    }
+  }
+
+  const String statusLine = apiClient.readStringUntil('\n');
+  if (!statusLine.startsWith("HTTP/")) {
+    Serial.printf("%s %s -> -1 (bad status)\n", method, path, statusLine.c_str());
+    apiClient.stop();
+    return -1;
+  }
+  const int sp = statusLine.indexOf(' ');
+  const int code = statusLine.substring(sp + 1, statusLine.indexOf(' ', sp + 1)).toInt();
+
+  int contentLength = -1;
+  bool chunked = false;
+  bool serverClosed = false;
+  while (true) {
+    const String h = apiClient.readStringUntil('\n');
+    if (h.length() <= 2) break;  // blank line ends the header block
+    const int colon = h.indexOf(':');
+    if (colon < 0) continue;
+    const String name = h.substring(0, colon);
+    String trimmed = name;
+    trimmed.trim();
+    String value = h.substring(colon + 1);
+    value.trim();
+    if (trimmed.equalsIgnoreCase("Content-Length")) contentLength = value.toInt();
+    else if (trimmed.equalsIgnoreCase("Transfer-Encoding") && value.indexOf("chunked") >= 0) chunked = true;
+    else if (trimmed.equalsIgnoreCase("Connection") && value.indexOf("close") >= 0) serverClosed = true;
+  }
+
+  if (body) {
+    char buf[256];
+    if (chunked) {
+      while (true) {
+        const String szLine = apiClient.readStringUntil('\n');
+        const long sz = strtol(szLine.c_str(), nullptr, 16);
+        if (sz <= 0) break;
+        long left = sz;
+        while (left > 0) {
+          const int want = (left < (long)sizeof(buf)) ? left : (long)sizeof(buf);
+          const int got = readPatience((uint8_t*)buf, (int)want, timeoutMs);
+          if (got <= 0) break;
+          body->concat(buf, got);
+          left -= got;
+        }
+        apiClient.readStringUntil('\n');  // CRLF after each chunk
+      }
+    } else if (contentLength >= 0) {
+      int left = contentLength;
+      while (left > 0) {
+        const int want = (left < (int)sizeof(buf)) ? left : (int)sizeof(buf);
+        const int got = readPatience((uint8_t*)buf, want, timeoutMs);
+        if (got <= 0) break;
+        body->concat(buf, got);
+        left -= got;
+      }
+    } else {
+      // Neither Length nor chunked: would need a blind read-to-close; fail
+      // instead of stalling the UI loop
+      apiClient.stop();
+      return -1;
+    }
+  }
+
+  if (serverClosed) apiClient.stop();
+  Serial.printf("%s %s -> %d (%lu ms)\n", method, path, code, millis() - t0);
+  return code;
+}
+
+int apiRequestRetry(const uint32_t timeoutMs, const String& path, const char* method,
+                    const String& payload, String* body) {
+  int code = apiRequest(timeoutMs, path, method, payload, body);
+  if (code <= 0) {
+    // Socket was stale/fin'd while idle: one honest retry on a fresh connection
+    apiClient.stop();
+    code = apiRequest(timeoutMs, path, method, payload, body);
+    if (code <= 0) apiClient.stop();
+  }
+  return code;
+}
+
 int fetchStates() {
-  HTTPClient http;
-  http.begin(String(API_BASE) + "/switches");
-  http.setTimeout(5000);
-  const int code = http.GET();
+  String body;
+  const int code = apiRequestRetry(5000, "/switches", "GET", "", &body);
   if (code != 200) {
-    http.end();
+    Serial.printf("GET /switches failed: %d\n", code);
     return code == -1 ? -1 : -code;
   }
-  const String body = http.getString();
-  http.end();
 
   JsonDocument doc;
   const DeserializationError err = deserializeJson(doc, body);
@@ -352,16 +507,13 @@ int fetchStates() {
 }
 
 int callSwitch(int index, bool on) {
-  HTTPClient http;
-  http.begin(String(API_BASE) + "/switch/" + SWITCH_NAMES[index] + (on ? "/on" : "/off"));
-  http.setTimeout(8000);
-  const int code = http.POST("");
+  String body;
+  const int code = apiRequestRetry(8000,
+      String("/switch/") + SWITCH_NAMES[index] + (on ? "/on" : "/off"),
+      "POST", "", &body);
   if (code != 200) {
-    http.end();
     return code == -1 ? -1 : -code;
   }
-  const String body = http.getString();
-  http.end();
 
   JsonDocument doc;
   const DeserializationError err = deserializeJson(doc, body);
@@ -411,6 +563,10 @@ void processToggle() {
 void setup() {
   Serial.begin(115200);
 
+  // Same trust level the old per-request path had (TLSTraits with no CA ->
+  // setInsecure). Pin the bornholm CA instead if verification is wanted.
+  apiClient.setInsecure();
+
   tft.Set_Rotation(1);  // landscape 480x320
   touch.init();         // TP_RESX reset + register settle, else touch stays dead
   touch.Set_Rotation(1); // match display: ly = 319 - rawX, lx = rawY
@@ -433,11 +589,13 @@ void setup() {
   lv_timer_handler();
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // modem sleep eats idle TCP connections
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
     delay(250);
   }
   lastRefresh = 0;
+  initApiEndpoint();
 }
 
 void loop() {
@@ -445,8 +603,13 @@ void loop() {
   delay(5);
 
   const bool wifiUp = WiFi.status() == WL_CONNECTED;
+  static bool hadWifi = true;
   if (!wifiUp) {
     static unsigned long lastRetry = 0;
+    if (hadWifi) {
+      apiClient.stop();  // stale TLS socket from before the drop
+      hadWifi = false;
+    }
     if (millis() - lastRetry > 5000) {
       lastRetry = millis();
       if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
@@ -454,6 +617,7 @@ void loop() {
     }
     return;
   }
+  hadWifi = true;
 
   if (pendingToggle >= 0) {
     processToggle();
